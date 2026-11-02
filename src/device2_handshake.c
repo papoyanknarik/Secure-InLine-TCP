@@ -1,236 +1,255 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <openssl/err.h>
 #include <openssl/crypto.h>
-#include <openssl/rand.h>
 #include "crypto_utils.h"
 
-#define PORT 6000
 #define KEY_SIZE 32
-int recv_all(int fd, unsigned char *buf, size_t len) {
-    size_t received = 0;
+#define PORT 6000
 
-    while (received < len) {
-        ssize_t n = recv(fd, buf + received, len - received, 0);
-        if (n <= 0) return -1;
-        received += (size_t)n;
+static int send_all(int fd, const unsigned char *data, size_t len) {
+    size_t pos = 0;
+
+    while (pos < len) {
+        ssize_t n = send(fd, data + pos, len - pos, 0);
+        if (n <= 0)
+            return 0;
+        pos += (size_t)n;
     }
-
-    return 0;
+    return 1;
 }
+
+static int recv_all(int fd, unsigned char *data, size_t len) {
+    size_t pos = 0;
+
+    while (pos < len) {
+        ssize_t n = recv(fd, data + pos, len - pos, 0);
+        if (n <= 0)
+            return 0;
+        pos += (size_t)n;
+    }
+    return 1;
+}
+
 int main(void) {
-    int server_fd, client_fd;
-    struct sockaddr_in address;
+    int server_fd = -1, client_fd = -1;
+    int success = 0, opt = 1;
 
-    EVP_PKEY_CTX *ctx = NULL;
-    EVP_PKEY *device2_key = NULL;
-    EVP_PKEY *peer_key = NULL;
-    EVP_PKEY_CTX *derive_ctx = NULL;
+    EVP_PKEY_CTX *key_ctx = NULL, *derive_ctx = NULL;
+    EVP_PKEY *device2_key = NULL, *peer_key = NULL;
 
-    unsigned char public_key[KEY_SIZE];
-    unsigned char peer_public_key[KEY_SIZE];
-    unsigned char shared_secret[KEY_SIZE];
+    unsigned char public_key[KEY_SIZE] = {0};
+    unsigned char peer_public_key[KEY_SIZE] = {0};
+    unsigned char shared_secret[KEY_SIZE] = {0};
+    unsigned char salt[32] = {0};
 
-    size_t public_len = sizeof(public_key);
-    size_t secret_len = sizeof(shared_secret);
+    unsigned char session_key[KEY_SIZE] = {0};
+    unsigned char confirmation_key[CONFIRM_KEY_SIZE] = {0};
+    unsigned char psk[PSK_SIZE] = {0};
 
-    ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+    unsigned char transcript[96] = {0};
+    unsigned char auth_data[sizeof(transcript) + 32] = {0};
 
-    if (!ctx ||
-        EVP_PKEY_keygen_init(ctx) <= 0 ||
-        EVP_PKEY_keygen(ctx, &device2_key) <= 0 ||
-        EVP_PKEY_get_raw_public_key(
-            device2_key, public_key, &public_len) <= 0) {
-        ERR_print_errors_fp(stderr);
-        return 1;
+    unsigned char auth_hmac[HMAC_SIZE] = {0};
+    unsigned char received_auth_hmac[HMAC_SIZE] = {0};
+    unsigned char confirmation_hmac[HMAC_SIZE] = {0};
+    unsigned char received_confirmation[HMAC_SIZE] = {0};
+
+    size_t public_len = KEY_SIZE;
+    size_t secret_len = KEY_SIZE;
+
+    const unsigned char device2_auth_label[] = "Device2 PSK auth";
+    const unsigned char device1_auth_label[] = "Device1 PSK auth";
+    const unsigned char device2_confirm_label[] = "Device2 confirmation";
+    const unsigned char device1_confirm_label[] = "Device1 confirmation";
+
+    struct sockaddr_in address = {0};
+
+    if (!load_psk("secrets/device_psk.hex", psk)) {
+        fprintf(stderr, "Device2: Failed to load PSK!\n");
+        goto cleanup;
     }
 
-    EVP_PKEY_CTX_free(ctx);
+    key_ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+
+    if (key_ctx == NULL ||
+        EVP_PKEY_keygen_init(key_ctx) <= 0 ||
+        EVP_PKEY_keygen(key_ctx, &device2_key) <= 0 ||
+        EVP_PKEY_get_raw_public_key(device2_key, public_key, &public_len) <= 0 ||
+        public_len != KEY_SIZE) {
+        ERR_print_errors_fp(stderr);
+        goto cleanup;
+    }
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
 
     if (server_fd < 0) {
         perror("socket");
-        return 1;
+        goto cleanup;
     }
 
-    memset(&address, 0, sizeof(address));
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
     address.sin_family = AF_INET;
     address.sin_port = htons(PORT);
     address.sin_addr.s_addr = inet_addr("10.0.2.2");
 
-    if (bind(server_fd, (struct sockaddr *)&address,
-             sizeof(address)) < 0) {
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         perror("bind");
-        return 1;
+        goto cleanup;
     }
 
     if (listen(server_fd, 1) < 0) {
         perror("listen");
-        return 1;
+        goto cleanup;
     }
 
     printf("Device2: Waiting for handshake...\n");
+    fflush(stdout);
 
     client_fd = accept(server_fd, NULL, NULL);
 
     if (client_fd < 0) {
         perror("accept");
-        return 1;
+        goto cleanup;
     }
 
     printf("Device2: Device1 connected!\n");
 
-    if (recv(client_fd, peer_public_key, KEY_SIZE,
-              MSG_WAITALL) != KEY_SIZE) {
-        fprintf(stderr, "Failed to receive public key\n");
-        return 1;
+    if (!recv_all(client_fd, peer_public_key, KEY_SIZE) ||
+        !send_all(client_fd, public_key, KEY_SIZE)) {
+        fprintf(stderr, "Device2: Public key exchange failed!\n");
+        goto cleanup;
     }
 
-    printf("Device2: Received Device1 public key!\n");
-
-    if (send(client_fd, public_key, KEY_SIZE, 0) != KEY_SIZE) {
-        perror("Failed to send public key");
-        return 1;
-    }
-
-    printf("Device2: Public key sent!\n");
+    printf("Device2: Public keys exchanged!\n");
 
     peer_key = EVP_PKEY_new_raw_public_key(
-        EVP_PKEY_X25519, NULL, peer_public_key, KEY_SIZE);
+        EVP_PKEY_X25519, NULL, peer_public_key, KEY_SIZE
+    );
 
     derive_ctx = EVP_PKEY_CTX_new(device2_key, NULL);
 
-    if (!peer_key || !derive_ctx ||
+    if (peer_key == NULL || derive_ctx == NULL ||
         EVP_PKEY_derive_init(derive_ctx) <= 0 ||
         EVP_PKEY_derive_set_peer(derive_ctx, peer_key) <= 0 ||
-        EVP_PKEY_derive(derive_ctx, shared_secret, &secret_len) <= 0) {
+        EVP_PKEY_derive(derive_ctx, shared_secret, &secret_len) <= 0 ||
+        secret_len != KEY_SIZE) {
         ERR_print_errors_fp(stderr);
-        return 1;
+        goto cleanup;
     }
 
-    printf("Device2: Shared secret derived successfully!\n");
+    printf("Device2: Shared secret derived!\n");
 
-    unsigned char salt[32];
-
-    if (RAND_bytes(salt, sizeof(salt)) != 1) {
-        ERR_print_errors_fp(stderr);
-        return 1;
+    if (RAND_bytes(salt, sizeof(salt)) != 1 ||
+        !send_all(client_fd, salt, sizeof(salt))) {
+        fprintf(stderr, "Device2: Salt exchange failed!\n");
+        goto cleanup;
     }
 
-    if (send(client_fd, salt, sizeof(salt), 0) != sizeof(salt)) {
-        perror("Failed to send salt");
-        return 1;
+    memcpy(transcript, peer_public_key, KEY_SIZE);
+    memcpy(transcript + KEY_SIZE, public_key, KEY_SIZE);
+    memcpy(transcript + 2 * KEY_SIZE, salt, sizeof(salt));
+
+    memcpy(auth_data, transcript, sizeof(transcript));
+
+    memcpy(auth_data + sizeof(transcript),
+           device2_auth_label, sizeof(device2_auth_label) - 1);
+
+    if (!compute_hmac(
+            psk, sizeof(psk), auth_data,
+            sizeof(transcript) + sizeof(device2_auth_label) - 1,
+            auth_hmac) ||
+        !send_all(client_fd, auth_hmac, HMAC_SIZE)) {
+        fprintf(stderr, "Device2: PSK authentication send failed!\n");
+        goto cleanup;
     }
 
-    unsigned char session_key[SESSION_KEY_LENGTH];
+    memcpy(auth_data + sizeof(transcript),
+           device1_auth_label, sizeof(device1_auth_label) - 1);
 
-    if (!generate_session_key(
-            shared_secret,
-            secret_len,
-            salt,
-            sizeof(salt),
-            session_key)) {
-        fprintf(stderr, "HKDF failed!\n");
-        return 1;
+    if (!compute_hmac(
+            psk, sizeof(psk), auth_data,
+            sizeof(transcript) + sizeof(device1_auth_label) - 1,
+            auth_hmac) ||
+        !recv_all(client_fd, received_auth_hmac, HMAC_SIZE) ||
+        CRYPTO_memcmp(auth_hmac, received_auth_hmac, HMAC_SIZE) != 0) {
+        fprintf(stderr, "Device2: PSK authentication failed!\n");
+        goto cleanup;
     }
 
-    printf("Device2: Session key derived successfully!\n");
+    printf("SUCCESS: Device1 PSK authentication verified!\n");
 
-unsigned char confirmation_key[CONFIRM_KEY_SIZE];
-
-if (!derive_confirmation_key(shared_secret, secret_len,
-                             salt, sizeof(salt), confirmation_key)) {
-    fprintf(stderr, "Confirmation key derivation failed!\n");
-    return 1;
-}
-
-unsigned char transcript[96];
-memcpy(transcript, peer_public_key, 32);
-memcpy(transcript + 32, public_key, 32);
-memcpy(transcript + 64, salt, 32);
-
-const unsigned char label[] = "Device2 confirmation";
-unsigned char data[sizeof(transcript) + sizeof(label) - 1];
-
-memcpy(data, transcript, sizeof(transcript));
-memcpy(data + sizeof(transcript), label, sizeof(label) - 1);
-
-unsigned char confirmation_hmac[HMAC_SIZE];
-
-if (!compute_hmac(confirmation_key, sizeof(confirmation_key),
-                  data, sizeof(data), confirmation_hmac)) {
-    fprintf(stderr, "HMAC generation failed!\n");
-    return 1;
-}
-
-printf("Device2: Confirmation HMAC generated!\n");
-
-size_t sent = 0;
-
-while (sent < sizeof(confirmation_hmac)) {
-    ssize_t n = send(client_fd, confirmation_hmac + sent,
-                     sizeof(confirmation_hmac) - sent, 0);
-
-    if (n <= 0) {
-        perror("Failed to send confirmation HMAC");
-        return 1;
+    if (!generate_session_key(shared_secret, secret_len,
+                            salt, sizeof(salt), session_key) ||
+        !derive_confirmation_key(shared_secret, secret_len,
+                                  salt, sizeof(salt), confirmation_key)) {
+        fprintf(stderr, "Device2: HKDF failed!\n");
+        goto cleanup;
     }
 
-    sent += n;
-}
+    memcpy(auth_data + sizeof(transcript),
+           device2_confirm_label, sizeof(device2_confirm_label) - 1);
 
-printf("Device2: Confirmation HMAC sent!\n");
-const unsigned char device1_label[] = "Device1 confirmation";
-unsigned char device1_data[sizeof(transcript) + sizeof(device1_label) - 1];
+    if (!compute_hmac(
+            confirmation_key, sizeof(confirmation_key),
+            auth_data,
+            sizeof(transcript) + sizeof(device2_confirm_label) - 1,
+            confirmation_hmac) ||
+        !send_all(client_fd, confirmation_hmac, HMAC_SIZE)) {
+        fprintf(stderr, "Device2: Confirmation send failed!\n");
+        goto cleanup;
+    }
 
-memcpy(device1_data, transcript, sizeof(transcript));
-memcpy(device1_data + sizeof(transcript),
-       device1_label, sizeof(device1_label) - 1);
+    memcpy(auth_data + sizeof(transcript),
+           device1_confirm_label, sizeof(device1_confirm_label) - 1);
 
-unsigned char expected_device1_hmac[HMAC_SIZE];
-unsigned char received_device1_hmac[HMAC_SIZE];
+    if (!compute_hmac(
+            confirmation_key, sizeof(confirmation_key),
+            auth_data,
+            sizeof(transcript) + sizeof(device1_confirm_label) - 1,
+            confirmation_hmac) ||
+        !recv_all(client_fd, received_confirmation, HMAC_SIZE) ||
+        CRYPTO_memcmp(confirmation_hmac,
+                      received_confirmation, HMAC_SIZE) != 0) {
+        fprintf(stderr, "Device2: Key confirmation failed!\n");
+        goto cleanup;
+    }
 
-if (!compute_hmac(confirmation_key, sizeof(confirmation_key),
-                  device1_data, sizeof(device1_data),
-                  expected_device1_hmac)) {
-    fprintf(stderr, "Device1 HMAC generation failed!\n");
-    return 1;
-}
+    printf("SUCCESS: Device1 key confirmation verified!\n");
+    printf("Device2: Authenticated handshake completed!\n");
 
-if (recv_all(client_fd, received_device1_hmac,
-             sizeof(received_device1_hmac)) < 0) {
-    fprintf(stderr, "Device1 HMAC receive failed!\n");
-    return 1;
-}
+    success = 1;
 
-if (CRYPTO_memcmp(expected_device1_hmac,
-                  received_device1_hmac, HMAC_SIZE) != 0) {
-    fprintf(stderr, "ERROR: Device1 key confirmation failed!\n");
-    return 1;
-}
-
-printf("SUCCESS: Device1 key confirmation verified!\n");
-
-OPENSSL_cleanse(expected_device1_hmac, sizeof(expected_device1_hmac));
-OPENSSL_cleanse(received_device1_hmac, sizeof(received_device1_hmac));
-OPENSSL_cleanse(confirmation_key, sizeof(confirmation_key));
-OPENSSL_cleanse(confirmation_hmac, sizeof(confirmation_hmac));
-
-    OPENSSL_cleanse(session_key, sizeof(session_key));
+cleanup:
     OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
+    OPENSSL_cleanse(session_key, sizeof(session_key));
+    OPENSSL_cleanse(confirmation_key, sizeof(confirmation_key));
+    OPENSSL_cleanse(psk, sizeof(psk));
 
+    OPENSSL_cleanse(auth_hmac, sizeof(auth_hmac));
+    OPENSSL_cleanse(received_auth_hmac, sizeof(received_auth_hmac));
+    OPENSSL_cleanse(confirmation_hmac, sizeof(confirmation_hmac));
+    OPENSSL_cleanse(received_confirmation, sizeof(received_confirmation));
+
+    EVP_PKEY_CTX_free(key_ctx);
     EVP_PKEY_CTX_free(derive_ctx);
-    EVP_PKEY_free(peer_key);
     EVP_PKEY_free(device2_key);
+    EVP_PKEY_free(peer_key);
 
-    close(client_fd);
-    close(server_fd);
+    if (client_fd >= 0)
+        close(client_fd);
 
-    return 0;
+    if (server_fd >= 0)
+        close(server_fd);
+
+    return success ? 0 : 1;
 }

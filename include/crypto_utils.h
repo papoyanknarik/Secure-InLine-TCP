@@ -30,4 +30,16 @@ int derive_confirmation_key(
     size_t salt_len,
     unsigned char confirmation_key[CONFIRM_KEY_SIZE]
 );
+#define PSK_SIZE 32
+
+int load_psk(
+    const char *filename,
+    unsigned char psk[PSK_SIZE]
+);
+#define PSK_SIZE 32
+
+int load_psk(
+    const char *filename,
+    unsigned char psk[PSK_SIZE]
+);
 #endif
