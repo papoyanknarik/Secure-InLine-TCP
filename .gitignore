@@ -27,3 +27,5 @@ test_hmac
 /test_tcp_seq
 /test_packet_pipeline
 /test_packet_pipeline
+/test_crypto_pipeline
+/test_encrypted_packet
