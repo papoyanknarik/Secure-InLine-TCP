@@ -11,7 +11,7 @@
 #include <openssl/err.h>
 #include <openssl/crypto.h>
 #include "crypto_utils.h"
-
+#include "tunnel_keys.h"
 #define KEY_SIZE 32
 #define PORT 6000
 
@@ -52,6 +52,8 @@ int main(void) {
     unsigned char salt[32] = {0};
 
     unsigned char session_key[KEY_SIZE] = {0};
+unsigned char forward_key[TUNNEL_KEY_SIZE] = {0};
+unsigned char reverse_key[TUNNEL_KEY_SIZE] = {0};
     unsigned char confirmation_key[CONFIRM_KEY_SIZE] = {0};
     unsigned char psk[PSK_SIZE] = {0};
 
@@ -185,7 +187,12 @@ int main(void) {
         fprintf(stderr, "Device2: PSK authentication failed!\n");
         goto cleanup;
     }
+if (!derive_tunnel_keys(session_key, forward_key, reverse_key)) {
+    fprintf(stderr, "Device1: Tunnel key derivation failed!\n");
+    goto cleanup;
+}
 
+printf("Device2: Directional tunnel keys derived!\n");
     printf("SUCCESS: Device1 PSK authentication verified!\n");
 
     if (!generate_session_key(shared_secret, secret_len,
@@ -230,7 +237,9 @@ int main(void) {
     success = 1;
 
 cleanup:
-    OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
+OPENSSL_cleanse(forward_key, sizeof(forward_key));
+OPENSSL_cleanse(reverse_key, sizeof(reverse_key));  
+  OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
     OPENSSL_cleanse(session_key, sizeof(session_key));
     OPENSSL_cleanse(confirmation_key, sizeof(confirmation_key));
     OPENSSL_cleanse(psk, sizeof(psk));
