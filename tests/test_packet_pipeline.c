@@ -1,0 +1,292 @@
+
+#include <stdio.h>
+#include <stdint.h>
+#include <assert.h>
+#include <string.h>
+
+#include "packet_parser.h"
+#include "checksum.h"
+#include "tcp_seq.h"
+
+static void write16(uint8_t *p, uint16_t value) {
+    p[0] = (uint8_t)(value >> 8);
+    p[1] = (uint8_t)value;
+}
+
+static void write32(uint8_t *p, uint32_t value) {
+    p[0] = (uint8_t)(value >> 24);
+    p[1] = (uint8_t)(value >> 16);
+    p[2] = (uint8_t)(value >> 8);
+    p[3] = (uint8_t)value;
+}
+
+static uint16_t read16(const uint8_t *p) {
+    return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
+
+static void create_packet(
+    uint8_t *packet,
+    uint32_t source_ip,
+    uint32_t destination_ip,
+    uint16_t source_port,
+    uint16_t destination_port
+) {
+    memset(packet, 0, 40);
+
+    packet[0] = 0x45;
+    write16(packet + 2, 40);
+    packet[8] = 64;
+    packet[9] = 6;
+
+    write32(packet + 12, source_ip);
+    write32(packet + 16, destination_ip);
+
+    write16(packet + 20, source_port);
+    write16(packet + 22, destination_port);
+
+    write32(packet + 24, 1000);
+    packet[32] = 0x50;
+    packet[33] = 0x02;
+    write16(packet + 34, 4096);
+
+    write16(packet + 10, ipv4_checksum(packet, 20));
+    write16(packet + 36, tcp_checksum(packet, 40));
+}
+
+int main(void) {
+
+    assert(tcp_translate_seq(1000, 128) == 1128);
+    assert(tcp_translate_seq(1000, 0) == 1000);
+
+    TcpSegmentMapping mapping;
+
+    assert(tcp_segment_mapping_init(
+        &mapping, 1000, 1000, 100, 128
+    ) == 1);
+
+    assert(mapping.original_seq == 1000);
+    assert(mapping.translated_seq == 1000);
+    assert(mapping.original_length == 100);
+    assert(mapping.encrypted_length == 128);
+
+    assert(tcp_segment_original_end(&mapping) == 1100);
+    assert(tcp_segment_translated_end(&mapping) == 1128);
+
+    const TcpSegmentMapping *found =
+        tcp_find_segment(&mapping, 1, 1000);
+
+    assert(found != NULL);
+    assert(found->original_seq == 1000);
+
+    const TcpSegmentMapping *exact =
+        tcp_find_exact_segment(&mapping, 1, 1000, 100);
+
+    assert(exact != NULL);
+
+    const TcpSegmentMapping *partial =
+        tcp_find_exact_segment(&mapping, 1, 1000, 50);
+
+    assert(partial == NULL);
+
+    assert(tcp_segments_overlap(1000, 100, 1050, 50) == 1);
+    assert(tcp_segments_overlap(1000, 100, 1100, 100) == 0);
+    assert(tcp_segments_overlap(1000, 100, 1200, 50) == 0);
+    assert(tcp_segments_overlap(1000, 100, 1000, 100) == 1);
+    assert(tcp_segments_overlap(1050, 50, 1000, 100) == 1);
+    assert(tcp_segments_overlap(1000, 0, 1050, 50) == 0);
+    assert(tcp_segments_overlap(UINT32_MAX - 9, 20, 0, 5) == 1);
+
+    assert(tcp_segments_overlap(UINT32_MAX - 4, 10, 0, 5) == 1);
+    assert(tcp_segments_overlap(0, 5, UINT32_MAX - 4, 10) == 1);
+    assert(tcp_segments_overlap(UINT32_MAX - 4, 5, 0, 5) == 0);
+    assert(tcp_segments_overlap(1000, 100, 900, 100) == 0);
+    assert(tcp_segments_overlap(1000, 100, 999, 1) == 0);
+    assert(tcp_segments_overlap(1000, 100, 0x80000000U, 100) == 0);
+    assert(tcp_segments_overlap(0, 100, 0x80000000U, 100) == 0);
+
+    TcpSegmentTable table = {0};
+    TcpSegmentMapping current_entry;
+
+    assert(tcp_segment_table_add(
+        &table, 1000, 100, 128, &current_entry
+    ) == TCP_SEGMENT_NEW);
+
+    assert(current_entry.translated_seq == 1000);
+    assert(table.segment_count == 1);
+
+    assert(tcp_segment_table_add(
+        &table, 1100, 100, 128, &current_entry
+    ) == TCP_SEGMENT_NEW);
+
+    assert(current_entry.translated_seq == 1128);
+    assert(table.segment_count == 2);
+
+    assert(tcp_segment_table_add(
+        &table, 1000, 100, 128, &current_entry
+    ) == TCP_SEGMENT_RETRANSMISSION);
+
+    assert(current_entry.translated_seq == 1000);
+    assert(table.segment_count == 2);
+
+    assert(tcp_segment_table_add(
+        &table, 1050, 50, 78, &current_entry
+    ) == TCP_SEGMENT_OVERLAP);
+
+    assert(table.segment_count == 2);
+
+    TcpSegmentTable out_of_order = {0};
+    TcpSegmentMapping out_entry;
+
+    assert(tcp_segment_table_add(
+        &out_of_order, 1100, 100, 128, &out_entry
+    ) == TCP_SEGMENT_NEW);
+
+    assert(tcp_segment_table_add(
+        &out_of_order, 1000, 100, 128, &out_entry
+    ) == TCP_SEGMENT_NEW);
+
+    assert(out_of_order.entries[0].translated_seq == 1100);
+    assert(out_of_order.entries[1].translated_seq == 1000);
+
+    /* ACK translation tests */
+
+    TcpSegmentTable ack_table = {0};
+    TcpSegmentMapping ack_mapping;
+
+    assert(tcp_segment_table_add(
+        &ack_table,
+        1000,
+        100,
+        128,
+        &ack_mapping
+    ) == TCP_SEGMENT_NEW);
+
+    uint32_t original_ack = 0;
+
+    assert(tcp_translate_ack(
+        &ack_table, 1000, &original_ack
+    ) == TCP_ACK_UNMAPPED);
+
+    assert(tcp_translate_ack(
+        &ack_table, 1128, &original_ack
+    ) == TCP_ACK_MAPPED);
+
+    assert(original_ack == 1100);
+
+    assert(tcp_translate_ack(
+        NULL, 1128, &original_ack
+    ) == TCP_ACK_UNMAPPED);
+
+    assert(tcp_translate_ack(
+        &ack_table, 1128, NULL
+    ) == TCP_ACK_UNMAPPED);
+
+    TcpSegmentTable wrap_table = {0};
+    TcpSegmentMapping wrap_segment;
+
+    assert(tcp_segment_table_add(
+        &wrap_table, UINT32_MAX - 15, 20, 48, &wrap_segment
+    ) == TCP_SEGMENT_NEW);
+
+    assert(tcp_translate_ack(
+        &wrap_table, 32, &original_ack
+    ) == TCP_ACK_MAPPED);
+
+    assert(original_ack == 4);
+
+    TcpSegmentTable recovery_table = {0};
+    TcpSegmentMapping recovery_mapping;
+
+    assert(tcp_segment_table_add(
+        &recovery_table, 1000, 100, 128, &recovery_mapping
+    ) == TCP_SEGMENT_NEW);
+
+    assert(tcp_segment_table_add(
+        &recovery_table, 900, 100, 128, &recovery_mapping
+    ) == TCP_SEGMENT_ERROR);
+
+    assert(recovery_table.segment_count == 1);
+
+    assert(tcp_segment_table_add(
+        &recovery_table, 1100, 100, 128, &recovery_mapping
+    ) == TCP_SEGMENT_NEW);
+
+    assert(recovery_mapping.translated_seq == 1128);
+    assert(recovery_table.segment_count == 2);
+
+    /* Packet payload tests */
+
+    uint8_t data_packet[45];
+
+    memset(data_packet, 0, sizeof(data_packet));
+
+    create_packet(
+        data_packet,
+        0x0A000101,
+        0x0A000302,
+        45000,
+        5000
+    );
+
+    write16(data_packet + 2, sizeof(data_packet));
+    data_packet[33] = 0x18;
+
+    memcpy(data_packet + 40, "HELLO", 5);
+
+    write16(data_packet + 10, 0);
+    write16(data_packet + 36, 0);
+
+    write16(data_packet + 10, ipv4_checksum(data_packet, 20));
+    write16(data_packet + 36, tcp_checksum(data_packet, sizeof(data_packet)));
+
+    ParsedPacket data_parsed = {0};
+
+    assert(parse_tcp_packet(
+        data_packet, sizeof(data_packet), &data_parsed
+    ) == 1);
+
+    assert(data_parsed.payload_len == 5);
+    assert(memcmp(data_parsed.payload, "HELLO", 5) == 0);
+
+    uint16_t original_tcp_checksum = read16(data_packet + 36);
+
+    memcpy(data_packet + 40, "WORLD", 5);
+
+    write16(data_packet + 36, 0);
+    write16(data_packet + 36, tcp_checksum(data_packet, sizeof(data_packet)));
+
+    assert(read16(data_packet + 36) != original_tcp_checksum);
+
+    assert(parse_tcp_packet(
+        data_packet, sizeof(data_packet), &data_parsed
+    ) == 1);
+
+    assert(memcmp(data_parsed.payload, "WORLD", 5) == 0);
+uint16_t saved_tcp_checksum = read16(data_packet + 36);
+
+write16(data_packet + 36, 0);
+
+uint16_t calculated_tcp_checksum =
+    tcp_checksum(data_packet, sizeof(data_packet));
+
+assert(saved_tcp_checksum == calculated_tcp_checksum);
+
+data_packet[40] ^= 0x01;
+
+uint16_t corrupted_tcp_checksum =
+    tcp_checksum(data_packet, sizeof(data_packet));
+
+assert(corrupted_tcp_checksum != saved_tcp_checksum);
+
+data_packet[40] ^= 0x01;
+
+assert(tcp_checksum(
+    data_packet, sizeof(data_packet)
+) == saved_tcp_checksum);
+
+write16(data_packet + 36, saved_tcp_checksum);
+
+    printf("TCP sequence tests completed successfully!\n");
+
+    return 0;
+}

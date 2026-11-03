@@ -6,6 +6,7 @@ uint32_t tcp_translate_seq(
 ) {
     return original_seq + (uint32_t)offset;
 }
+
 int tcp_segment_mapping_init(
     TcpSegmentMapping *mapping,
     uint32_t original_seq,
@@ -24,6 +25,7 @@ int tcp_segment_mapping_init(
 
     return 1;
 }
+
 uint32_t tcp_segment_original_end(
     const TcpSegmentMapping *mapping
 ) {
@@ -43,6 +45,7 @@ uint32_t tcp_segment_translated_end(
 
     return mapping->translated_seq + mapping->encrypted_length;
 }
+
 const TcpSegmentMapping *tcp_find_segment(
     const TcpSegmentMapping *segments,
     size_t segment_count,
@@ -53,7 +56,6 @@ const TcpSegmentMapping *tcp_find_segment(
     }
 
     for (size_t i = 0; i < segment_count; i++) {
-
         if (segments[i].original_seq == sequence_number) {
             return &segments[i];
         }
@@ -61,6 +63,7 @@ const TcpSegmentMapping *tcp_find_segment(
 
     return NULL;
 }
+
 const TcpSegmentMapping *tcp_find_exact_segment(
     const TcpSegmentMapping *segments,
     size_t segment_count,
@@ -72,16 +75,15 @@ const TcpSegmentMapping *tcp_find_exact_segment(
     }
 
     for (size_t i = 0; i < segment_count; i++) {
-
         if (segments[i].original_seq == sequence_number &&
             segments[i].original_length == data_length) {
-
             return &segments[i];
         }
     }
 
     return NULL;
 }
+
 int tcp_segments_overlap(
     uint32_t first_seq,
     uint32_t first_len,
@@ -98,6 +100,7 @@ int tcp_segments_overlap(
     return first_distance < first_len ||
            second_distance < second_len;
 }
+
 TcpSegmentStatus tcp_segment_table_add(
     TcpSegmentTable *table,
     uint32_t original_seq,
@@ -113,13 +116,11 @@ TcpSegmentStatus tcp_segment_table_add(
     }
 
     for (size_t i = 0; i < table->segment_count; i++) {
-
         const TcpSegmentMapping *current = &table->entries[i];
 
         if (current->original_seq == original_seq &&
             current->original_length == original_length &&
             current->encrypted_length == encrypted_length) {
-
             *result = *current;
             return TCP_SEGMENT_RETRANSMISSION;
         }
@@ -129,7 +130,6 @@ TcpSegmentStatus tcp_segment_table_add(
                 current->original_length,
                 original_seq,
                 original_length)) {
-
             return TCP_SEGMENT_OVERLAP;
         }
     }
@@ -138,22 +138,19 @@ TcpSegmentStatus tcp_segment_table_add(
         return TCP_SEGMENT_ERROR;
     }
 
-    uint32_t translated_seq = original_seq;
     uint32_t total_offset = 0;
 
     for (size_t i = 0; i < table->segment_count; i++) {
-
         const TcpSegmentMapping *current = &table->entries[i];
 
         if ((int32_t)(original_seq -
             tcp_segment_original_end(current)) >= 0) {
-
             total_offset += current->encrypted_length -
                             current->original_length;
         }
     }
 
-    translated_seq += total_offset;
+    uint32_t translated_seq = original_seq + total_offset;
 
     TcpSegmentMapping *new_entry =
         &table->entries[table->segment_count];
@@ -164,7 +161,6 @@ TcpSegmentStatus tcp_segment_table_add(
             translated_seq,
             original_length,
             encrypted_length)) {
-
         return TCP_SEGMENT_ERROR;
     }
 
@@ -173,4 +169,37 @@ TcpSegmentStatus tcp_segment_table_add(
     *result = *new_entry;
 
     return TCP_SEGMENT_NEW;
+}
+
+TcpAckStatus tcp_translate_ack(
+    const TcpSegmentTable *table,
+    uint32_t translated_ack,
+    uint32_t *original_ack
+) {
+    if (table == NULL || original_ack == NULL ||
+        table->segment_count > TCP_MAX_SEGMENTS) {
+        return TCP_ACK_UNMAPPED;
+    }
+
+    uint32_t total_offset = 0;
+
+    for (size_t i = 0; i < table->segment_count; i++) {
+        const TcpSegmentMapping *current = &table->entries[i];
+
+        uint32_t translated_end =
+            tcp_segment_translated_end(current);
+
+        if ((int32_t)(translated_ack - translated_end) >= 0) {
+            total_offset += current->encrypted_length -
+                            current->original_length;
+        }
+    }
+
+    if (total_offset == 0) {
+        return TCP_ACK_UNMAPPED;
+    }
+
+    *original_ack = translated_ack - total_offset;
+
+    return TCP_ACK_MAPPED;
 }
