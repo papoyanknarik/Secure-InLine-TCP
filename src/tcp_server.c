@@ -1,3 +1,4 @@
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,10 @@ int main(void) {
         perror("socket");
         return 1;
     }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
+               &opt, sizeof(opt));
 
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
@@ -52,6 +57,16 @@ int main(void) {
     if (n > 0) {
         buffer[n] = '\0';
         printf("Received: %s\n", buffer);
+
+        const char *response =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 29\r\n"
+            "Connection: close\r\n\r\n"
+            "Secure TCP test successful!";
+
+        send(client_fd, response, strlen(response), 0);
+        printf("Response sent to PC1.\n");
     } else if (n < 0) {
         perror("recv");
     }
