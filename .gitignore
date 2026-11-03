@@ -31,3 +31,6 @@ test_hmac
 /test_encrypted_packet
 /test_crypto_pipeline
 /test_encrypted_packet
+/test_tun_device
+/test_tun_reader
+/test_tun_crypto
