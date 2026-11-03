@@ -47,3 +47,6 @@ test_hmac
 /secure_tunnel
 /test_device_pipeline
 /test_handshake_integration
+*.save
+*.save.*
+test_tcp_connection
